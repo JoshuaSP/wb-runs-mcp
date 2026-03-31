@@ -54,11 +54,15 @@ def _error(msg: str) -> str:
 
 def _get_history_cols(run, stream: str = "default") -> list[str]:
     """Get all column names from a run's history."""
-    h = run.history(samples=2, stream=stream)
+    h = run.history(samples=5, stream=stream)
     if hasattr(h, "columns"):
         return sorted(h.columns.tolist())
     elif isinstance(h, list) and h:
-        return sorted(h[0].keys())
+        # Union keys across all rows — sparse rows may omit some columns
+        all_keys: set[str] = set()
+        for row in h:
+            all_keys.update(row.keys())
+        return sorted(all_keys)
     return sorted(run.summary.keys())
 
 
