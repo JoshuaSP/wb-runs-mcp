@@ -52,9 +52,9 @@ def _error(msg: str) -> str:
     return json.dumps({"error": msg})
 
 
-def _get_history_cols(run) -> list[str]:
+def _get_history_cols(run, stream: str = "default") -> list[str]:
     """Get all column names from a run's history."""
-    h = run.history(samples=2, pandas=True)
+    h = run.history(samples=2, stream=stream)
     if hasattr(h, "columns"):
         return sorted(h.columns.tolist())
     elif isinstance(h, list) and h:
@@ -75,8 +75,65 @@ def _metric_stats(values: list[float | int]) -> dict[str, Any]:
     }
 
 
+def _is_system_metric(name: str) -> bool:
+    return name.startswith("system.") or name.startswith("system/")
+
+
 def _fetch_metric_data(run, metrics: list[str], min_step=None, max_step=None, max_points=200) -> list[dict]:
     """Fetch and downsample metric data from a run."""
+    # Split metrics by stream — system.* metrics live on a separate stream
+    user_metrics = [m for m in metrics if not _is_system_metric(m)]
+    sys_metrics = [m for m in metrics if _is_system_metric(m)]
+
+    rows = []
+    if user_metrics:
+        # Include _timestamp for aligning with system metrics
+        fetch_keys = user_metrics if not sys_metrics else user_metrics + ["_timestamp"]
+        rows = _fetch_from_stream(run, fetch_keys, "default", min_step, max_step, max_points)
+
+    if sys_metrics:
+        sys_rows = _fetch_from_stream(run, sys_metrics, "system", min_step, max_step, max_points)
+        if rows:
+            # Merge system data into user rows by nearest _runtime
+            # User rows have _timestamp, system rows have _runtime — use _timestamp for alignment
+            sys_by_ts = {r.get("_timestamp", 0): r for r in sys_rows if r.get("_timestamp")}
+            sys_timestamps = sorted(sys_by_ts.keys())
+            for row in rows:
+                ts = row.get("_timestamp", 0)
+                if sys_timestamps and ts:
+                    nearest = min(sys_timestamps, key=lambda s: abs(s - ts))
+                    for m in sys_metrics:
+                        row[m] = sys_by_ts[nearest].get(m)
+        else:
+            rows = sys_rows
+
+    data_points = []
+    for r in rows:
+        point: dict[str, Any] = {"step": r.get("_step")}
+        for m in metrics:
+            point[m] = _clean_val(r.get(m))
+        data_points.append(point)
+    return data_points
+
+
+def _fetch_from_stream(run, metrics: list[str], stream: str, min_step, max_step, max_points) -> list[dict]:
+    """Fetch metric data from a specific wandb history stream."""
+    if stream == "system":
+        # System stream uses _runtime not _step, and keys= filter is broken
+        # in the wandb SDK — must fetch all columns and filter client-side
+        h = run.history(samples=max_points, stream="system")
+        if hasattr(h, "to_dict"):
+            rows = h.to_dict("records")
+        elif isinstance(h, list):
+            rows = h
+        else:
+            rows = []
+        # Add a synthetic _step from _runtime for alignment
+        for r in rows:
+            if "_step" not in r:
+                r["_step"] = r.get("_runtime", 0)
+        return rows
+
     if min_step is not None or max_step is not None:
         rows = []
         for r in run.scan_history(keys=metrics + ["_step"]):
@@ -90,21 +147,14 @@ def _fetch_metric_data(run, metrics: list[str], min_step=None, max_step=None, ma
             stride = len(rows) / max_points
             rows = [rows[int(i * stride)] for i in range(max_points)]
     else:
-        h = run.history(keys=metrics, samples=max_points, pandas=True)
+        h = run.history(keys=metrics, samples=max_points, stream=stream)
         if hasattr(h, "to_dict"):
             rows = h.to_dict("records")
         elif isinstance(h, list):
             rows = h
         else:
             rows = []
-
-    data_points = []
-    for r in rows:
-        point: dict[str, Any] = {"step": r.get("_step")}
-        for m in metrics:
-            point[m] = _clean_val(r.get(m))
-        data_points.append(point)
-    return data_points
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +334,8 @@ Args:
   - project: W&B project name
   - run_id: the 8-character run ID (e.g. "m94p3szz")
   - entity: W&B entity/team (optional, defaults to your account)
+  - include_system: if true, also list system metrics (GPU util, memory, temp, etc.) \
+These are logged on a separate stream by wandb. Default false to keep output compact.
 
 Returns: id, name, state, created_at, tags, url, config, step_count, \
 available metrics (grouped by prefix), and summary values (final value of each metric).
@@ -295,6 +347,7 @@ def get_run(
     project: str,
     run_id: str,
     entity: str | None = None,
+    include_system: bool = False,
 ) -> str:
     try:
         api = _api()
@@ -308,6 +361,17 @@ def get_run(
         for m in user_metrics:
             prefix = m.split("/")[0] if "/" in m else "(ungrouped)"
             grouped.setdefault(prefix, []).append(m)
+
+        # System metrics (GPU util, memory, temp, etc.) are on a separate stream
+        if include_system:
+            sys_cols = _get_history_cols(run, stream="system")
+            sys_metrics = [c for c in sys_cols if not c.startswith("_")]
+            sys_grouped: dict[str, list[str]] = {}
+            for m in sys_metrics:
+                prefix = m.split(".")[0] if "." in m else "(ungrouped)"
+                sys_grouped.setdefault(prefix, []).append(m)
+            for prefix, metrics in sys_grouped.items():
+                grouped[f"system/{prefix}"] = metrics
 
         summary = {k: _clean_val(v) for k, v in run.summary.items() if not k.startswith("_")}
 
