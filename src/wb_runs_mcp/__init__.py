@@ -410,6 +410,10 @@ Args:
   - entity: W&B entity/team (optional, defaults to your account)
   - min_step / max_step: optional step range to zoom into a region
   - max_points: cap on returned data points (default 200, hard max 500). Auto-downsamples.
+  - smooth: if true, apply exponential moving average (EMA) to each metric. \
+Returns smoothed values alongside raw values. Useful for seeing trends in noisy \
+per-step data (like loss curves). The smoothing weight adapts to the number of \
+data points — heavier smoothing for more points.
 
 Returns data points (step + values) plus summary stats (min, max, mean, final) per metric.
 """
@@ -424,6 +428,7 @@ def get_metrics(
     min_step: int | None = None,
     max_step: int | None = None,
     max_points: int = 200,
+    smooth: bool = False,
 ) -> str:
     try:
         api = _api()
@@ -433,15 +438,36 @@ def get_metrics(
         max_points = min(max_points, 500)
         data_points = _fetch_metric_data(run, metrics, min_step, max_step, max_points)
 
+        # Apply EMA smoothing if requested
+        if smooth and data_points:
+            # Adapt weight to data density: more points = heavier smoothing
+            # ~0.9 for 200 points, ~0.95 for 500, ~0.8 for 50
+            n = len(data_points)
+            alpha = max(0.6, min(0.95, 1 - 10 / n)) if n > 15 else 0.5
+            for m in metrics:
+                ema = None
+                for p in data_points:
+                    raw = p[m]
+                    if raw is not None and isinstance(raw, (int, float)):
+                        ema = raw if ema is None else alpha * ema + (1 - alpha) * raw
+                        p[f"{m}_smooth"] = round(ema, 6)
+                    else:
+                        p[f"{m}_smooth"] = None
+
         stats: dict[str, dict[str, Any]] = {}
         for m in metrics:
             values = [p[m] for p in data_points if p[m] is not None and isinstance(p[m], (int, float))]
             stats[m] = _metric_stats(values)
+            if smooth:
+                smooth_key = f"{m}_smooth"
+                smooth_vals = [p[smooth_key] for p in data_points if p.get(smooth_key) is not None and isinstance(p[smooth_key], (int, float))]
+                stats[smooth_key] = _metric_stats(smooth_vals)
 
         return json.dumps({
             "run_id": run_id,
             "run_name": run.name,
             "num_points": len(data_points),
+            "smoothed": smooth,
             "step_range": [data_points[0]["step"], data_points[-1]["step"]] if data_points else None,
             "stats": stats,
             "data": data_points,
