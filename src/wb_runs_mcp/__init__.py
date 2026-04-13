@@ -52,6 +52,43 @@ def _error(msg: str) -> str:
     return json.dumps({"error": msg})
 
 
+def _compact_config(config: dict, expand_keys: list[str] | None = None) -> dict:
+    """Summarize a config dict: scalars inline, nested dicts collapsed unless expanded.
+
+    expand_keys supports dot-notation to drill into nested dicts:
+      ["train_cfg"] → expand top-level train_cfg
+      ["train_cfg.algorithm"] → expand train_cfg.algorithm, collapse rest of train_cfg
+    """
+    expand_set = set(expand_keys) if expand_keys else set()
+
+    def _should_recurse(child_path: str) -> bool:
+        """Check if any expand key requires us to drill into this path."""
+        return any(ek == child_path or ek.startswith(child_path + ".") for ek in expand_set)
+
+    def _summarize(obj: Any, path: str = "") -> Any:
+        if not isinstance(obj, dict):
+            return obj
+        if path in expand_set:
+            return obj
+        result = {}
+        for k, v in obj.items():
+            child_path = f"{path}.{k}" if path else k
+            if isinstance(v, dict):
+                if child_path in expand_set:
+                    result[k] = v
+                elif _should_recurse(child_path):
+                    result[k] = _summarize(v, child_path)
+                else:
+                    result[k] = f"{{...}} ({len(v)} keys)"
+            elif isinstance(v, list) and len(v) > 5:
+                result[k] = f"[...] ({len(v)} items)"
+            else:
+                result[k] = v
+        return result
+
+    return _summarize(config)
+
+
 def _get_history_cols(run, stream: str = "default") -> list[str]:
     """Get all column names from a run's history."""
     h = run.history(samples=5, stream=stream)
@@ -328,21 +365,24 @@ def list_runs(
 # ---------------------------------------------------------------------------
 
 GET_RUN_DESC = """\
-Get full detail for a single run: config, all available metric names (grouped by prefix), \
-summary/final values, step count, and metadata.
+Get full detail for a single run: config, available metrics, summary values, step count.
 
-Use this after list_runs to inspect a specific run, or before get_metrics to discover \
-what metrics are available.
+Config is shown in compact form by default — scalars inline, nested dicts collapsed \
+to "{...} (N keys)". Use config_keys to expand specific sections.
 
 Args:
   - project: W&B project name
   - run_id: the 8-character run ID (e.g. "m94p3szz")
   - entity: W&B entity/team (optional, defaults to your account)
+  - config_keys: list of dot-notation paths to expand in the config. \
+Examples: ["train_cfg"] expands the whole train_cfg section. \
+["train_cfg.algorithm", "env_cfg.actions"] expands just those subsections. \
+Omit to get a compact overview of all top-level config keys.
   - include_system: if true, also list system metrics (GPU util, memory, temp, etc.) \
 These are logged on a separate stream by wandb. Default false to keep output compact.
 
-Returns: id, name, state, created_at, tags, url, config, step_count, \
-available metrics (grouped by prefix), and summary values (final value of each metric).
+Returns: id, name, state, created_at, tags, url, config (compact or expanded), \
+step_count, available metrics (grouped by prefix), and summary values.
 """
 
 
@@ -351,6 +391,7 @@ def get_run(
     project: str,
     run_id: str,
     entity: str | None = None,
+    config_keys: list[str] | None = None,
     include_system: bool = False,
 ) -> str:
     try:
@@ -378,6 +419,7 @@ def get_run(
                 grouped[f"system/{prefix}"] = metrics
 
         summary = {k: _clean_val(v) for k, v in run.summary.items() if not k.startswith("_")}
+        config = _compact_config(run.config, expand_keys=config_keys)
 
         return json.dumps({
             "id": run.id,
@@ -386,7 +428,7 @@ def get_run(
             "created_at": run.created_at,
             "tags": run.tags,
             "url": run.url,
-            "config": run.config,
+            "config": config,
             "step_count": run.summary.get("_step"),
             "metrics": grouped,
             "total_metrics": len(user_metrics),
