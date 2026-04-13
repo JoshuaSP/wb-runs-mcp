@@ -16,7 +16,19 @@ from typing import Any
 import wandb
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("wandb")
+mcp = FastMCP(
+    "wb — Weights & Biases Experiment Tracker",
+    instructions="""\
+This is the W&B (wb) MCP server for reading experiment tracking data.
+
+Use these tools when the user asks about:
+- Training runs, metrics, loss curves, or experiment comparisons
+- W&B projects, run configs, or hyperparameter searches
+- "How is training going?", "what was the best run?", "compare these runs"
+
+Workflow: list_projects → list_runs (filter/search) → get_run (detail + metrics list) → get_metrics (time-series data) or compare_runs (side-by-side).
+""",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
